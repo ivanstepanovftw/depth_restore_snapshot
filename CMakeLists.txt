@@ -36,9 +36,9 @@ if (NOT MSVC)
             -Werror=format-security
             -Werror=return-type
             )
-    #target_compile_options(${TARGET} PUBLIC
-    #        -Werror
-    #        )
+    target_compile_options(${TARGET} PUBLIC
+            -Werror
+            )
 else()
     target_compile_options(${TARGET} PUBLIC
             /Ox
@@ -52,10 +52,10 @@ target_include_directories(${TARGET} PUBLIC
 #target_link_libraries(${TARGET} PUBLIC
 #        )
 
-include(PVS-Studio.cmake)
-pvs_studio_add_target(TARGET ${TARGET}.analyze ALL
-        OUTPUT FORMAT errorfile
-        ANALYZE ${TARGET}
-        MODE GA:1,2,3 OP
-        LOG target.err
-        )
+#include(PVS-Studio.cmake)
+#pvs_studio_add_target(TARGET ${TARGET}.analyze ALL
+#        OUTPUT FORMAT errorfile
+#        ANALYZE ${TARGET}
+#        MODE GA:1,2,3 OP
+#        LOG target.err
+#        )

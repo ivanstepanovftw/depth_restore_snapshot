@@ -13,7 +13,6 @@
 #include <chrono>
 #include <array>
 #include <iomanip>
-#include <algorithm>
 #include <map>
 #include "rapidjson/document.h"
 #include "rapidjson/writer.h"
@@ -59,7 +58,8 @@ namespace {
       std::clog << m_what << ": done in " << calculate() << " seconds" << std::endl;
     }
 
-    double calculate() {
+    [[nodiscard]]
+    double calculate() const {
       return std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::high_resolution_clock::now() - m_tp)
           .count();
     }
@@ -73,75 +73,88 @@ namespace {
 
 
 class DepthSnapshot {
-  rapidjson::Document d;
-
  protected:
-  const static int64_t PRECISION_MULT = 400; // To avoid epsilon, multiply by this and convert to integer. Based on `1/<tick size>` formula.
+  using stored_price_t = int64_t;
+  using stored_amount_t = int64_t;
 
-  uint64_t m_timestamp{};
-  // std::map is collection of key-value pairs, sorted by keys, keys are unique
-  /// Note: do not try to use another comparator, than {@code std::less}.
-  // Price can be negative. To avoid integer overflow, signed integer used both for price and amount
-  std::map<int64_t /* (price * PRECISION_MULT) */, int64_t /* amount */> m_bids; // Buy orders. Last element (largest) is best price
-  std::map<int64_t /* (price * PRECISION_MULT) */, int64_t /* amount */> m_asks; // Sell orders. First element (smallest) is best price
+  int m_error_code = 0;
+  double m_tick_size = 0.01; // To avoid epsilon, price will be divided by tick_size and stored as "key" in std::map.
+  uint64_t m_timestamp = 0;
+  // std::map is collection of key-value pairs, sorted by keys, keys are unique.
+  // Implementation note: do not try to use another comparator, than {@code std::less}.
+  // Price can be negative. To avoid integer overflow, signed integer used both for price and amount.
+  std::map<stored_price_t, stored_amount_t> m_bids; // Buy orders. Last element is best price.
+  std::map<stored_price_t, stored_amount_t> m_asks; // Sell orders. First element is best price.
 
-  inline static int64_t f2i(double f) {
-    return static_cast<int64_t>(f * PRECISION_MULT);
+  /**
+   * Converts price
+   */
+  [[nodiscard]]
+  inline stored_price_t storePrice(double price) const {
+    return static_cast<stored_price_t>(price / m_tick_size);
   }
 
-  inline static double i2f(int64_t i) {
-    return static_cast<double>(i) / static_cast<double>(PRECISION_MULT);
+  [[nodiscard]]
+  inline double restorePrice(stored_price_t key) const {
+    return static_cast<double>(key) * m_tick_size;
   }
 
  public:
   DepthSnapshot() = default;
 
-  [[maybe_unused]]
-  explicit DepthSnapshot(const std::string &message) {
-    apply(message);
+  /**
+   * Returns tick size
+   */
+  [[nodiscard]]
+  double getTickSize() const {
+    return m_tick_size;
+  }
+
+  void setTickSize(double tickSize) {
+    m_tick_size = tickSize;
   }
 
   /**
-   * @returns {@code false} is something bad happen
+   * @returns {@code false} is something bad happen. Check {@code DepthSnapshot::error()}
    */
   bool apply(const std::string &message) {
-    using namespace std;
-
-    d.Parse(message.c_str());
-    if UNLIKELY(!d.HasMember("tick")) {
+    rapidjson::Document document;
+    document.Parse(message.c_str());
+    if UNLIKELY(!document.HasMember("tick")) {
       return true; // in case it is ping or invalid message
     }
-    auto &tick = d["tick"];
-    auto &ts = tick["ts"];
+    const auto &tick = document["tick"];
+    const auto &ts = tick["ts"];
     m_timestamp = ts.GetUint64();
 
-    if UNLIKELY(string_view(tick["event"].GetString()) == "snapshot") {
+    if UNLIKELY(std::string_view(tick["event"].GetString()) == "snapshot") {
       m_bids.clear();
       m_asks.clear();
       for (const auto &bids : tick["bids"].GetArray()) {
-        const auto kv = bids.GetArray();
-        // todo check if size is eq to 2
-        if UNLIKELY(kv.Empty())
-          continue;
-        const auto price = kv.Begin(); // float point
-        const auto amount = price + 1; // integer
+        const auto &price_amount_pair = bids.GetArray();
+        if UNLIKELY(price_amount_pair.Size() != 2) {
+          m_error_code = 1;
+          return false;
+        }
+        const auto &price_s = price_amount_pair.Begin();
+        const auto &amount_s = price_s + 1;
 
-        const int64_t p = f2i(price->GetDouble());
-        const int64_t v = amount->GetInt64();
-
-        m_bids[p] = v;
+        const stored_price_t price = storePrice(price_s->GetDouble());
+        const stored_amount_t amount = amount_s->GetInt64();
+        m_bids[price] = amount;
       }
-      for (const auto &bids : tick["asks"].GetArray()) {
-        const auto kv = bids.GetArray();
-        if UNLIKELY(kv.Empty())
-          continue;
-        const auto price = kv.Begin();
-        const auto amount = price + 1;
+      for (const auto &asks : tick["asks"].GetArray()) {
+        const auto &price_amount_pair = asks.GetArray();
+        if UNLIKELY(price_amount_pair.Size() != 2) {
+          m_error_code = 1;
+          return false;
+        }
+        const auto &price_s = price_amount_pair.Begin();
+        const auto &amount_s = price_s + 1;
 
-        const int64_t p = f2i(price->GetDouble());
-        const int64_t v = amount->GetInt64();
-
-        m_asks[p] = v;
+        const stored_price_t price = storePrice(price_s->GetDouble());
+        const stored_amount_t amount = amount_s->GetInt64();
+        m_asks[price] = amount;
       }
     }
     /**
@@ -149,39 +162,43 @@ class DepthSnapshot {
      */
     if LIKELY(std::string_view(tick["event"].GetString()) == "update") {
       for (const auto &bids : tick["bids"].GetArray()) {
-        const auto kv = bids.GetArray();
-        if UNLIKELY(kv.Empty())
-          continue;
-        const auto price = kv.Begin();
-        const auto amount = price + 1;
+        const auto &price_amount_pair = bids.GetArray();
+        if UNLIKELY(price_amount_pair.Size() != 2) {
+          m_error_code = 1;
+          return false;
+        }
+        const auto &price_s = price_amount_pair.Begin();
+        const auto &amount_s = price_s + 1;
 
-        const int64_t p = f2i(price->GetDouble());
-        const int64_t v = amount->GetInt64();
+        const stored_price_t price = storePrice(price_s->GetDouble());
+        const stored_amount_t amount = amount_s->GetInt64();
 
-        if UNLIKELY(v == 0) {
-          m_bids.erase(p);
+        if (amount == 0) {
+          m_bids.erase(price);
           continue;
         }
-        m_bids[p] = v;
+        m_bids[price] = amount;
         if (m_bids.size() > 20) {
           m_bids.erase(m_bids.begin());
         }
       }
       for (const auto &asks : tick["asks"].GetArray()) {
-        const auto kv = asks.GetArray();
-        if UNLIKELY(kv.Empty())
-          continue;
-        const auto price = kv.Begin();
-        const auto amount = price + 1;
+        const auto &price_amount_pair = asks.GetArray();
+        if UNLIKELY(price_amount_pair.Size() != 2) {
+          m_error_code = 1;
+          return false;
+        }
+        const auto &price_s = price_amount_pair.Begin();
+        const auto &amount_s = price_s + 1;
 
-        const int64_t p = f2i(price->GetDouble());
-        const int64_t v = amount->GetInt64();
+        const stored_price_t price = storePrice(price_s->GetDouble());
+        const stored_amount_t amount = amount_s->GetInt64();
 
-        if UNLIKELY(v == 0) {
-          m_asks.erase(p);
+        if (amount == 0) {
+          m_asks.erase(price);
           continue;
         }
-        m_asks[p] = v;
+        m_asks[price] = amount;
         if (m_asks.size() > 20) {
           m_asks.erase(prev(m_asks.end()));
         }
@@ -189,45 +206,54 @@ class DepthSnapshot {
     }
     // assert check
     if UNLIKELY(m_bids.size() > 20) {
-      cerr << "m_bids size > 20" << endl;
+      m_error_code = 2;
       return false;
     }
     if UNLIKELY(m_asks.size() > 20) {
-      cerr << "m_asks size > 20" << endl;
+      m_error_code = 2;
       return false;
     }
     return true;
   }
 
   [[nodiscard]]
-  auto getTimestamp() const -> uint64_t {
+  auto getTimestamp() const {
     return m_timestamp;
   }
 
   [[nodiscard]]
-  auto getBestBid() const -> std::pair<double, uint64_t> {
+  auto getBestBid() const -> std::pair<double, int64_t> {
     if UNLIKELY(m_bids.empty())
-      return std::make_pair(0., 0);
+      return {0., 0};
     const auto bestBid = prev(m_bids.end());
-    return std::make_pair(i2f(bestBid->first), bestBid->second);
+    return {restorePrice(bestBid->first), bestBid->second};
   }
 
   [[nodiscard]]
-  auto getBestAsk() const -> std::pair<double, uint64_t> {
+  auto getBestAsk() const -> std::pair<double, int64_t> {
     if UNLIKELY(m_asks.empty())
-      return std::make_pair(0., 0);
+      return {0., 0};
     const auto bestAsk = m_asks.begin();
-    return std::make_pair(i2f(bestAsk->first), bestAsk->second);
+    return {restorePrice(bestAsk->first), bestAsk->second};
+  }
+
+  [[nodiscard]]
+  std::string error() {
+    std::string message;
+    switch (m_error_code) {
+      case 0: message = "No error"; break;
+      case 1: message = "Pair [price,amount] is invalid"; break;
+      case 2: message = "Bids or asks array size is > 20"; break;
+    }
+    m_error_code = 0;
+    return message;
   }
 };
 
 
 int main() {
-  using namespace std;
   using namespace rapidjson;
   Timer _main_timer("Overall");
-
-  DepthSnapshot dom;
 
   // Output file
   std::ofstream bestbidask("huobi_dm_depth.out.txt");
@@ -235,14 +261,14 @@ int main() {
 
   // Im using cache to measure real "message" parsing performance.
   // This vector contains "message"s from logs.
-  std::vector<string> huobi_dm_depth_messages;
-  const std::regex base_regex(R"raw(current time: (\d+), message: (.+))raw");
+  std::vector<std::string> huobi_dm_depth_messages;
+  const std::regex base_regex(R"regex(current time: (\d+), message: (.+))regex");
 
   std::ifstream huobi_dm_depth("huobi_dm_depth.log", std::ios::in);
   //std::istringstream huobi_dm_depth(logs);
   if (!huobi_dm_depth) {
-    cerr << "Cannot open stream. Set working directory to path where 'huobi_dm_depth.log' is." << endl;
-    exit(1);
+    std::cerr << "Cannot open stream. Set working directory to path where 'huobi_dm_depth.log' is." << std::endl;
+    return 1;
   }
 
   {
@@ -252,37 +278,38 @@ int main() {
       std::smatch time_message_match;
       if (std::regex_search(line, time_message_match, base_regex)) {
         if (time_message_match.size() != 3) {
-          clog << "Corrupted line? line: " << line << endl;
+          std::clog << "Corrupted line? line: " << line << std::endl;
           for (auto &a : time_message_match) {
-            clog << "Corrupted line? match: " << a << endl;
+            std::clog << "Corrupted line? match: " << a << std::endl;
           }
           return 1;
         }
 
-        string current_time = time_message_match[1].str();
-        string message = time_message_match[2].str();
+        //std::string current_time = time_message_match[1].str();
+        std::string message = time_message_match[2].str();
         huobi_dm_depth_messages.emplace_back(message);
       }
     }
   }
 
+  DepthSnapshot dom;
   {
-    Timer _timer("Parsing " + to_string(huobi_dm_depth_messages.size()) + " messages");
+    Timer _timer("Parsing " + std::to_string(huobi_dm_depth_messages.size()) + " messages");
     for (auto &message : huobi_dm_depth_messages) {
       bool success = dom.apply(message);
       if UNLIKELY(!success) {
-        cerr << "Something bad happen. message: " << message << endl;
+        std::cerr << "Error: "<<dom.error()<<". Message: " << message << std::endl;
         return 1;
       }
 
       uint64_t ts = dom.getTimestamp();
-      auto bid = dom.getBestBid();
-      auto ask = dom.getBestAsk();
+      std::pair bid = dom.getBestBid();
+      std::pair ask = dom.getBestAsk();
       bestbidask << ts << ", " << bid.first << ", " << bid.second << ", " << ask.first << ", " << ask.second << "\n";
     }
     std::cout << "Latency: " << (1e+3 * _timer.calculate() / static_cast<double>(huobi_dm_depth_messages.size()))
               << " ms per message"
-              << endl;
+              << std::endl;
   }
 
   return 0;
